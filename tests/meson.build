@@ -187,6 +187,7 @@ bad_fonts = [
   'fonts/bad/692df3e4b35e0b83cc8991a19ae29e434e705124.ttf',
   'fonts/bad/698e25666a75ea6121065b5fced5ccee62b65ca4.otf',
   'fonts/bad/6d2cc2870fabdc4fa686b66accd404759349e4a8.ttf',
+  'fonts/bad/7183f22f32dd736b2232c544f9ac8c7c1ed3ba5f.ttf',
   'fonts/bad/7304e91492c3ba14030446c92f084f8fb031e8e8.ttf',
   'fonts/bad/7522970cb3bb80a698c206cfa61f8418767c1704.ttf',
   'fonts/bad/7c8eefff708b374fffbce135ba28a4565766e560.otf',

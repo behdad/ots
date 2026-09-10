@@ -912,12 +912,18 @@ bool OpenTypeVARC::Parse(const uint8_t* data, size_t length) {
   }
 
   // The coverage table's glyphs index the glyphRecords sequentially, so their
-  // counts must agree. (An expected count of 0 disables the check; coverage
-  // cannot hold more than 0xFFFF glyphs anyway.)
-  const uint16_t expectedCoverageCount =
-      glyphRecordCount <= 0xFFFF ? static_cast<uint16_t>(glyphRecordCount) : 0;
+  // counts must agree. ParseCoverageTable treats an expected count of 0 as
+  // "don't check", and coverage cannot express more than 0xFFFF glyphs, so
+  // reject both extremes up front rather than skipping the check.
+  if (glyphRecordCount == 0) {
+    return Error("No glyph records");
+  }
+  if (glyphRecordCount > 0xFFFF) {
+    return Error("Too many glyph records: %u", glyphRecordCount);
+  }
   if (!ParseCoverageTable(font, data + coverageOffset, length - coverageOffset,
-                          state.numGlyphs, expectedCoverageCount)) {
+                          state.numGlyphs,
+                          static_cast<uint16_t>(glyphRecordCount))) {
     return Error("Failed to parse coverage table");
   }
 
