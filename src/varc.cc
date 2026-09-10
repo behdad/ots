@@ -548,6 +548,13 @@ bool ParseConditionUncached(const ots::Font* font, conditionContext& ctx,
       if (axisIndex >= state.axisCount) {
         return OTS_FAILURE_MSG("Condition axis index %u out of range", axisIndex);
       }
+      // The range is in normalized F2Dot14 coordinates, so within [-1, 1].
+      if (filterRangeMin < -0x4000 || filterRangeMax > 0x4000) {
+        return OTS_FAILURE_MSG("Condition filter range out of range");
+      }
+      if (filterRangeMin > filterRangeMax) {
+        OTS_WARNING("Misordered filter range in condition");
+      }
       return true;
     }
 
