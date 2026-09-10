@@ -481,13 +481,26 @@ bool ValidateVarIdx(const ots::Font* font, uint32_t varIdx,
 // Conditions may nest (formats 3, 4 and 5); bound the recursion.
 const uint32_t kConditionRecursionLimit = 64;
 
-bool ParseCondition(const ots::Font* font, const uint8_t* data, size_t length,
-                    const varcState& state, uint32_t depth) {
-  if (depth > kConditionRecursionLimit) {
-    return OTS_FAILURE_MSG("Excessive condition nesting");
-  }
+// A ConditionList together with, for each byte offset into it, whether the
+// condition starting there has already been validated. Child conditions may be
+// shared between parents; validating each one only once keeps the total work
+// linear in the list's size rather than exponential in the nesting depth.
+struct conditionContext {
+  const uint8_t* data;
+  size_t length;
+  std::vector<bool> validated;
+};
 
-  ots::Buffer subtable(data, length);
+bool ParseCondition(const ots::Font* font, conditionContext& ctx,
+                    size_t offset, const varcState& state, uint32_t depth);
+
+// Validate the condition at |offset| into the list (known to be in bounds).
+// Offsets to child conditions are relative to the condition containing them.
+bool ParseConditionUncached(const ots::Font* font, conditionContext& ctx,
+                            size_t offset, const varcState& state,
+                            uint32_t depth) {
+  ots::Buffer subtable(ctx.data + offset, ctx.length - offset);
+  const size_t length = subtable.remaining();
 
   uint16_t format;
   if (!subtable.ReadU16(&format)) {
@@ -528,15 +541,14 @@ bool ParseCondition(const ots::Font* font, const uint8_t* data, size_t length,
         return OTS_FAILURE_MSG("Failed to read condition format %u count", format);
       }
       for (unsigned i = 0; i < conditionCount; ++i) {
-        uint32_t offset;
-        if (!subtable.ReadU24(&offset)) {
+        uint32_t childOffset;
+        if (!subtable.ReadU24(&childOffset)) {
           return OTS_FAILURE_MSG("Failed to read child condition offset");
         }
-        if (offset < 2u || offset >= length) {
+        if (childOffset < 2u || childOffset >= length) {
           return OTS_FAILURE_MSG("Bad child condition offset");
         }
-        if (!ParseCondition(font, data + offset, length - offset, state,
-                            depth + 1)) {
+        if (!ParseCondition(font, ctx, offset + childOffset, state, depth + 1)) {
           return OTS_FAILURE_MSG("Failed to parse child condition");
         }
       }
@@ -544,15 +556,14 @@ bool ParseCondition(const ots::Font* font, const uint8_t* data, size_t length,
     }
 
     case 5: {  // ConditionNegate
-      uint32_t offset;
-      if (!subtable.ReadU24(&offset)) {
+      uint32_t childOffset;
+      if (!subtable.ReadU24(&childOffset)) {
         return OTS_FAILURE_MSG("Failed to read negated condition offset");
       }
-      if (offset < 2u || offset >= length) {
+      if (childOffset < 2u || childOffset >= length) {
         return OTS_FAILURE_MSG("Bad negated condition offset");
       }
-      if (!ParseCondition(font, data + offset, length - offset, state,
-                          depth + 1)) {
+      if (!ParseCondition(font, ctx, offset + childOffset, state, depth + 1)) {
         return OTS_FAILURE_MSG("Failed to parse negated condition");
       }
       return true;
@@ -561,6 +572,21 @@ bool ParseCondition(const ots::Font* font, const uint8_t* data, size_t length,
     default:
       return OTS_FAILURE_MSG("Unknown condition format: %u", format);
   }
+}
+
+bool ParseCondition(const ots::Font* font, conditionContext& ctx,
+                    size_t offset, const varcState& state, uint32_t depth) {
+  if (depth > kConditionRecursionLimit) {
+    return OTS_FAILURE_MSG("Excessive condition nesting");
+  }
+  if (ctx.validated[offset]) {
+    return true;
+  }
+  if (!ParseConditionUncached(font, ctx, offset, state, depth)) {
+    return false;
+  }
+  ctx.validated[offset] = true;
+  return true;
 }
 
 bool ParseConditionList(const ots::Font* font, const uint8_t* data,
@@ -573,6 +599,11 @@ bool ParseConditionList(const ots::Font* font, const uint8_t* data,
   }
   state->conditionCount = conditionCount;
 
+  conditionContext ctx;
+  ctx.data = data;
+  ctx.length = length;
+  ctx.validated.resize(length);
+
   for (unsigned i = 0; i < conditionCount; ++i) {
     uint32_t offset;
     if (!subtable.ReadU32(&offset)) {
@@ -581,7 +612,7 @@ bool ParseConditionList(const ots::Font* font, const uint8_t* data,
     if (offset < 4u || offset >= length) {
       return OTS_FAILURE_MSG("Bad condition offset");
     }
-    if (!ParseCondition(font, data + offset, length - offset, *state, 0)) {
+    if (!ParseCondition(font, ctx, offset, *state, 0)) {
       return OTS_FAILURE_MSG("Failed to parse condition %u", i);
     }
   }

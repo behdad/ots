@@ -108,6 +108,7 @@ good_fonts = [
   'fonts/good/e9b02051de5a2b3a3ae1e044e2c459421511a77f.otf',
   'fonts/good/e9e065f23e8c5c1559cdb76a7a350b857ce2713e.ttf',
   'fonts/good/ec0f5f1cccb6c5675b4f396b462eedf1acce7d95.ttf',
+  'fonts/good/eda24cab23c72532167b893ef939306f18b430e4.ttf',
   'fonts/good/ef7da53aaff13acd3e6dedda380a2ac0ef746cab.ttf',
   'fonts/good/f172aa07083478097b7ba62e485c9ffefcd0d623.ttf',
   'fonts/good/f60191da5f12f78d23ec32c6fdf51314ce3bb8c0.ttf',
