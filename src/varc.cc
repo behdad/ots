@@ -131,15 +131,21 @@ bool ReadUint32Var(ots::Buffer& buf, uint32_t* value) {
 //
 // If |count_known| is true, exactly |known_count| values are decoded (and the
 // buffer is left positioned immediately after them). Otherwise values are
-// decoded until |buf| is exhausted, and *out_count receives the number decoded.
+// decoded until |buf| is exhausted. *out_count (if non-NULL) receives the
+// number of values decoded, and *out_values (if non-NULL) the values.
 bool ParseTupleValues(const ots::Font* font, ots::Buffer& buf, bool count_known,
-                      size_t known_count, size_t* out_count) {
+                      size_t known_count, size_t* out_count,
+                      std::vector<int32_t>* out_values) {
   static const uint8_t VALUES_SIZE_MASK = 0xC0;
   static const uint8_t VALUES_ARE_BYTES = 0x00;
   static const uint8_t VALUES_ARE_WORDS = 0x40;
   static const uint8_t VALUES_ARE_ZEROS = 0x80;
   static const uint8_t VALUES_ARE_LONGS = 0xC0;
   static const uint8_t RUN_COUNT_MASK = 0x3F;
+
+  if (out_values) {
+    out_values->clear();
+  }
 
   size_t total = 0;
   for (;;) {
@@ -161,17 +167,37 @@ bool ParseTupleValues(const ots::Font* font, ots::Buffer& buf, bool count_known,
       return OTS_FAILURE_MSG("TupleValues run overshoots expected count");
     }
 
-    size_t elemSize;
-    switch (control & VALUES_SIZE_MASK) {
-      case VALUES_ARE_ZEROS: elemSize = 0; break;
-      case VALUES_ARE_BYTES: elemSize = 1; break;
-      case VALUES_ARE_WORDS: elemSize = 2; break;
-      case VALUES_ARE_LONGS: elemSize = 4; break;
-      default: elemSize = 0; break;  // unreachable
-    }
-
-    if (elemSize && !buf.Skip(run * elemSize)) {
-      return OTS_FAILURE_MSG("Failed to read TupleValues data");
+    for (size_t i = 0; i < run; ++i) {
+      int32_t value = 0;
+      bool ok = true;
+      switch (control & VALUES_SIZE_MASK) {
+        case VALUES_ARE_ZEROS:
+          break;
+        case VALUES_ARE_BYTES: {
+          uint8_t v;
+          ok = buf.ReadU8(&v);
+          value = static_cast<int8_t>(v);
+          break;
+        }
+        case VALUES_ARE_WORDS: {
+          uint16_t v;
+          ok = buf.ReadU16(&v);
+          value = static_cast<int16_t>(v);
+          break;
+        }
+        case VALUES_ARE_LONGS: {
+          uint32_t v;
+          ok = buf.ReadU32(&v);
+          value = static_cast<int32_t>(v);
+          break;
+        }
+      }
+      if (!ok) {
+        return OTS_FAILURE_MSG("Failed to read TupleValues data");
+      }
+      if (out_values) {
+        out_values->push_back(value);
+      }
     }
 
     total += run;
@@ -372,7 +398,8 @@ bool ParseMultiItemVariationData(const ots::Font* font, const uint8_t* data,
     ots::Buffer deltaSet(data + indexStart + deltaSets[i].offset,
                          deltaSets[i].length);
     size_t numValues = 0;
-    if (!ParseTupleValues(font, deltaSet, /*count_known=*/false, 0, &numValues)) {
+    if (!ParseTupleValues(font, deltaSet, /*count_known=*/false, 0, &numValues,
+                          NULL)) {
       return OTS_FAILURE_MSG("Failed to parse delta set %u",
                              static_cast<unsigned>(i));
     }
@@ -621,8 +648,8 @@ bool ParseConditionList(const ots::Font* font, const uint8_t* data,
 }
 
 // axisIndicesList: a CFF2-style Index whose entries are TupleValues encoding the
-// axis indices used by glyph components. Fills state.axisIndicesCounts with the
-// number of values in each entry.
+// axis indices used by glyph components. Each index must name an fvar axis.
+// Fills state.axisIndicesCounts with the number of values in each entry.
 bool ParseAxisIndicesList(const ots::Font* font, const uint8_t* data,
                           size_t length, varcState* state) {
   uint32_t count = 0;
@@ -634,11 +661,18 @@ bool ParseAxisIndicesList(const ots::Font* font, const uint8_t* data,
   state->axisIndicesCounts.clear();
   for (const auto& obj : objects) {
     ots::Buffer entry(data + obj.offset, obj.length);
-    size_t numValues = 0;
-    if (!ParseTupleValues(font, entry, /*count_known=*/false, 0, &numValues)) {
+    std::vector<int32_t> axisIndices;
+    if (!ParseTupleValues(font, entry, /*count_known=*/false, 0, NULL,
+                          &axisIndices)) {
       return OTS_FAILURE_MSG("Failed to parse axisIndices entry");
     }
-    state->axisIndicesCounts.push_back(static_cast<uint32_t>(numValues));
+    for (int32_t axisIndex : axisIndices) {
+      if (axisIndex < 0 || axisIndex >= state->axisCount) {
+        return OTS_FAILURE_MSG("Axis index %d out of range", axisIndex);
+      }
+    }
+    state->axisIndicesCounts.push_back(
+        static_cast<uint32_t>(axisIndices.size()));
   }
 
   return true;
@@ -694,8 +728,16 @@ bool ParseVarComponent(const ots::Font* font, ots::Buffer& rec,
                              axisIndicesIndex);
     }
     numAxisValues = state.axisIndicesCounts[axisIndicesIndex];
-    if (!ParseTupleValues(font, rec, /*count_known=*/true, numAxisValues, NULL)) {
+    std::vector<int32_t> axisValues;
+    if (!ParseTupleValues(font, rec, /*count_known=*/true, numAxisValues, NULL,
+                          &axisValues)) {
       return OTS_FAILURE_MSG("Failed to read component axis values");
+    }
+    // Axis values are normalized F2Dot14 coordinates, so within [-1, 1].
+    for (int32_t axisValue : axisValues) {
+      if (axisValue < -0x4000 || axisValue > 0x4000) {
+        return OTS_FAILURE_MSG("Component axis value %d out of range", axisValue);
+      }
     }
   }
 
