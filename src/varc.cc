@@ -38,15 +38,22 @@ enum VarcFlags : uint32_t {
   RESERVED_MASK              = ~((1u << 15) - 1),
 };
 
+// Tuple length recorded for the delta sets of a MultiItemVariationData that
+// has no regions: such delta sets contribute nothing, so any expected tuple
+// length is acceptable.
+const uint32_t kAnyTupleLength = 0xFFFFFFFFu;
+
 // State collected while parsing, used to validate cross-references between the
 // various sub-tables.
 struct varcState {
   uint16_t numGlyphs = 0;      // from maxp
   uint16_t axisCount = 0;      // from fvar (0 if no fvar table)
 
-  // MultiItemVariationStore: number of delta sets ("inner" index range) for
-  // each item variation data sub-table ("outer" index). Empty if no varStore.
-  std::vector<uint32_t> deltaSetCounts;
+  // MultiItemVariationStore: for each item variation data sub-table ("outer"
+  // index), the tuple length of each of its delta sets ("inner" index), i.e.
+  // the number of values the delta set supplies per region. Empty if no
+  // varStore.
+  std::vector<std::vector<uint32_t>> deltaSetTupleLengths;
 
   // Number of entries in the top-level ConditionList (0 if absent).
   uint32_t conditionCount = 0;
@@ -321,11 +328,11 @@ bool ParseSparseVariationRegionList(const ots::Font* font, const uint8_t* data,
   return true;
 }
 
-// A single MultiItemVariationData sub-table. *out_deltaSetCount receives the
-// number of delta sets it stores (the "inner" index range).
+// A single MultiItemVariationData sub-table. *out_tupleLengths receives the
+// tuple length of each delta set it stores (indexed by "inner" index).
 bool ParseMultiItemVariationData(const ots::Font* font, const uint8_t* data,
                                  size_t length, uint16_t regionCount,
-                                 uint32_t* out_deltaSetCount) {
+                                 std::vector<uint32_t>* out_tupleLengths) {
   ots::Buffer subtable(data, length);
 
   uint8_t format;
@@ -349,15 +356,49 @@ bool ParseMultiItemVariationData(const ots::Font* font, const uint8_t* data,
 
   // The remaining bytes are a CFF2-style Index of TupleValues (the delta sets).
   const size_t indexStart = subtable.offset();
+  uint32_t deltaSetCount = 0;
+  std::vector<IndexObject> deltaSets;
   if (!ParseCFF2Index(font, data + indexStart, length - indexStart,
-                      out_deltaSetCount, NULL)) {
+                      &deltaSetCount, &deltaSets)) {
     return OTS_FAILURE_MSG("Failed to parse delta sets Index");
+  }
+
+  // Each delta set is the concatenation of one tuple of values per region, so
+  // its value count must be a multiple of the region count; the quotient is
+  // the tuple length, which users of the delta set must agree with.
+  out_tupleLengths->clear();
+  out_tupleLengths->reserve(deltaSets.size());
+  for (size_t i = 0; i < deltaSets.size(); ++i) {
+    ots::Buffer deltaSet(data + indexStart + deltaSets[i].offset,
+                         deltaSets[i].length);
+    size_t numValues = 0;
+    if (!ParseTupleValues(font, deltaSet, /*count_known=*/false, 0, &numValues)) {
+      return OTS_FAILURE_MSG("Failed to parse delta set %u",
+                             static_cast<unsigned>(i));
+    }
+    if (regionIndexCount == 0) {
+      if (numValues != 0) {
+        return OTS_FAILURE_MSG("Delta set %u has values but no regions",
+                               static_cast<unsigned>(i));
+      }
+      out_tupleLengths->push_back(kAnyTupleLength);
+      continue;
+    }
+    if (numValues % regionIndexCount != 0) {
+      return OTS_FAILURE_MSG("Delta set %u has %u values, not a multiple of "
+                             "the region count %u",
+                             static_cast<unsigned>(i),
+                             static_cast<unsigned>(numValues),
+                             regionIndexCount);
+    }
+    out_tupleLengths->push_back(
+        static_cast<uint32_t>(numValues / regionIndexCount));
   }
 
   return true;
 }
 
-// MultiItemVariationStore. Fills state.deltaSetCounts.
+// MultiItemVariationStore. Fills state.deltaSetTupleLengths.
 bool ParseMultiItemVariationStore(const ots::Font* font, const uint8_t* data,
                                   size_t length, varcState* state) {
   ots::Buffer subtable(data, length);
@@ -386,7 +427,7 @@ bool ParseMultiItemVariationStore(const ots::Font* font, const uint8_t* data,
     return OTS_FAILURE_MSG("Failed to parse sparse variation region list");
   }
 
-  state->deltaSetCounts.clear();
+  state->deltaSetTupleLengths.clear();
   for (unsigned i = 0; i < dataCount; ++i) {
     uint32_t offset;
     if (!subtable.ReadU32(&offset)) {
@@ -395,12 +436,12 @@ bool ParseMultiItemVariationStore(const ots::Font* font, const uint8_t* data,
     if (offset < headerEnd || offset >= length) {
       return OTS_FAILURE_MSG("Bad item variation data offset");
     }
-    uint32_t deltaSetCount = 0;
+    std::vector<uint32_t> tupleLengths;
     if (!ParseMultiItemVariationData(font, data + offset, length - offset,
-                                     regionCount, &deltaSetCount)) {
+                                     regionCount, &tupleLengths)) {
       return OTS_FAILURE_MSG("Failed to parse item variation data %u", i);
     }
-    state->deltaSetCounts.push_back(deltaSetCount);
+    state->deltaSetTupleLengths.push_back(std::move(tupleLengths));
   }
 
   return true;
@@ -412,18 +453,27 @@ bool ParseMultiItemVariationStore(const ots::Font* font, const uint8_t* data,
 const uint32_t kNoVariationIndex = 0xFFFFFFFFu;
 
 // Validate a VarIdx (outer index in the top 16 bits, inner in the low 16 bits)
-// against the MultiItemVariationStore.
-bool ValidateVarIdx(const ots::Font* font, uint32_t varIdx, const varcState& state) {
+// against the MultiItemVariationStore. The delta set it refers to must supply
+// |tupleLength| values per region, as that is how many the user will read.
+bool ValidateVarIdx(const ots::Font* font, uint32_t varIdx,
+                    const varcState& state, uint32_t tupleLength) {
   if (varIdx == kNoVariationIndex) {
     return true;
   }
   const uint16_t outer = varIdx >> 16;
   const uint16_t inner = varIdx & 0xFFFFu;
-  if (outer >= state.deltaSetCounts.size()) {
+  if (outer >= state.deltaSetTupleLengths.size()) {
     return OTS_FAILURE_MSG("VarIdx outer index %u out of range", outer);
   }
-  if (inner >= state.deltaSetCounts[outer]) {
+  const std::vector<uint32_t>& tupleLengths = state.deltaSetTupleLengths[outer];
+  if (inner >= tupleLengths.size()) {
     return OTS_FAILURE_MSG("VarIdx inner index %u out of range", inner);
+  }
+  if (tupleLengths[inner] != kAnyTupleLength &&
+      tupleLengths[inner] != tupleLength) {
+    return OTS_FAILURE_MSG("VarIdx %u refers to a delta set of tuple length %u, "
+                           "expected %u", varIdx, tupleLengths[inner],
+                           tupleLength);
   }
   return true;
 }
@@ -465,7 +515,7 @@ bool ParseCondition(const ots::Font* font, const uint8_t* data, size_t length,
       if (!subtable.ReadS16(&defaultValue) || !subtable.ReadU32(&varIdx)) {
         return OTS_FAILURE_MSG("Failed to read condition format 2");
       }
-      if (!ValidateVarIdx(font, varIdx, state)) {
+      if (!ValidateVarIdx(font, varIdx, state, /*tupleLength=*/1)) {
         return OTS_FAILURE_MSG("Bad VarIdx in condition format 2");
       }
       return true;
@@ -602,6 +652,7 @@ bool ParseVarComponent(const ots::Font* font, ots::Buffer& rec,
   }
 
   // Axis values
+  size_t numAxisValues = 0;
   if (flags & HAVE_AXES) {
     uint32_t axisIndicesIndex;
     if (!ReadUint32Var(rec, &axisIndicesIndex)) {
@@ -611,9 +662,26 @@ bool ParseVarComponent(const ots::Font* font, ots::Buffer& rec,
       return OTS_FAILURE_MSG("Component axis indices index %u out of range",
                              axisIndicesIndex);
     }
-    const size_t numAxisValues = state.axisIndicesCounts[axisIndicesIndex];
+    numAxisValues = state.axisIndicesCounts[axisIndicesIndex];
     if (!ParseTupleValues(font, rec, /*count_known=*/true, numAxisValues, NULL)) {
       return OTS_FAILURE_MSG("Failed to read component axis values");
+    }
+  }
+
+  // Transform fields. Each present field is a single 16-bit value; they appear
+  // in this fixed order (translate, rotation, scale, skew, tcenter). The
+  // transform delta sets carry one value per present field.
+  static const uint32_t kTransformFields[] = {
+    HAVE_TRANSLATE_X, HAVE_TRANSLATE_Y,
+    HAVE_ROTATION,
+    HAVE_SCALE_X, HAVE_SCALE_Y,
+    HAVE_SKEW_X, HAVE_SKEW_Y,
+    HAVE_TCENTER_X, HAVE_TCENTER_Y,
+  };
+  uint32_t numTransformFields = 0;
+  for (uint32_t field : kTransformFields) {
+    if (flags & field) {
+      ++numTransformFields;
     }
   }
 
@@ -623,7 +691,8 @@ bool ParseVarComponent(const ots::Font* font, ots::Buffer& rec,
     if (!ReadUint32Var(rec, &axisValuesVarIndex)) {
       return OTS_FAILURE_MSG("Failed to read component axis values var index");
     }
-    if (!ValidateVarIdx(font, axisValuesVarIndex, state)) {
+    if (!ValidateVarIdx(font, axisValuesVarIndex, state,
+                        static_cast<uint32_t>(numAxisValues))) {
       return OTS_FAILURE_MSG("Bad axis values var index");
     }
   }
@@ -632,20 +701,12 @@ bool ParseVarComponent(const ots::Font* font, ots::Buffer& rec,
     if (!ReadUint32Var(rec, &transformVarIndex)) {
       return OTS_FAILURE_MSG("Failed to read component transform var index");
     }
-    if (!ValidateVarIdx(font, transformVarIndex, state)) {
+    if (!ValidateVarIdx(font, transformVarIndex, state, numTransformFields)) {
       return OTS_FAILURE_MSG("Bad transform var index");
     }
   }
 
-  // Transform fields. Each present field is a single 16-bit value; they appear
-  // in this fixed order (translate, rotation, scale, skew, tcenter).
-  static const uint32_t kTransformFields[] = {
-    HAVE_TRANSLATE_X, HAVE_TRANSLATE_Y,
-    HAVE_ROTATION,
-    HAVE_SCALE_X, HAVE_SCALE_Y,
-    HAVE_SKEW_X, HAVE_SKEW_Y,
-    HAVE_TCENTER_X, HAVE_TCENTER_Y,
-  };
+  // Transform fields.
   for (uint32_t field : kTransformFields) {
     if ((flags & field) && !rec.Skip(2)) {
       return OTS_FAILURE_MSG("Failed to read component transform field");
