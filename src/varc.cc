@@ -109,9 +109,11 @@ bool ReadUint32Var(ots::Buffer& buf, uint32_t* value) {
              (static_cast<uint32_t>(b2) << 8) | b3;
     return true;
   }
-  // 5-byte form. The high nibble (b0 - 0xF0) contributes bits at or above 32,
-  // which do not fit in a uint32; valid encodings use a lead byte of exactly
-  // 0xF0, so those bits are zero. We keep only the low 32 bits.
+  // 5-byte form. The low nibble of the lead byte contributes bits at or above
+  // 32, which do not fit in a uint32, so the only valid lead byte is 0xF0.
+  if (b0 != 0xF0) {
+    return false;
+  }
   uint8_t b1, b2, b3, b4;
   if (!buf.ReadU8(&b1) || !buf.ReadU8(&b2) || !buf.ReadU8(&b3) ||
       !buf.ReadU8(&b4)) {
