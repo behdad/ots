@@ -306,7 +306,8 @@ struct Font {
         num_tables(0),
         search_range(0),
         entry_selector(0),
-        range_shift(0) {
+        range_shift(0),
+        has_varc(false) {
   }
 
   bool ParseTable(const TableEntry& tableinfo, const uint8_t* data,
@@ -334,6 +335,11 @@ struct Font {
   uint16_t search_range;
   uint16_t entry_selector;
   uint16_t range_shift;
+
+  // Whether the input directory contains a VARC table.  This is known before
+  // dependent tables are parsed and permits the static-VARC exceptions for
+  // gvar and CFF2 fonts without fvar.
+  bool has_varc;
 
  private:
   std::map<uint32_t, Table*> m_tables;

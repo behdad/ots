@@ -721,6 +721,7 @@ bool ProcessGeneric(ots::FontFile *header,
   for (unsigned i = 0; i < font->num_tables; ++i) {
     table_map[tables[i].tag] = tables[i];
   }
+  font->has_varc = table_map.find(OTS_TAG_VARC) != table_map.end();
 
   ots::Arena arena;
   // Parse known tables first as we need to parse them in specific order.

@@ -4,10 +4,13 @@
 
 #include "varc.h"
 
+#include "cff.h"
 #include "fvar.h"
+#include "gvar.h"
 #include "layout.h"
 #include "maxp.h"
 
+#include <map>
 #include <vector>
 
 // VARC - Variable Composites / Components Table
@@ -47,13 +50,13 @@ const uint32_t kAnyTupleLength = 0xFFFFFFFFu;
 // various sub-tables.
 struct varcState {
   uint16_t numGlyphs = 0;      // from maxp
-  uint16_t axisCount = 0;      // from fvar (0 if no fvar table)
+  uint16_t axisCount = 0;      // from fvar or the base outline variation data
 
-  // MultiItemVariationStore: for each item variation data sub-table ("outer"
-  // index), the tuple length of each of its delta sets ("inner" index), i.e.
-  // the number of values the delta set supplies per region. Empty if no
-  // varStore.
-  std::vector<std::vector<uint32_t>> deltaSetTupleLengths;
+  // MultiItemVariationStore tuple lengths. Multiple outer indices may use the
+  // same subtable offset, so keep one vector per distinct subtable and map each
+  // outer index to it.
+  std::vector<std::vector<uint32_t>> uniqueDeltaSetTupleLengths;
+  std::vector<uint32_t> outerToTupleLengths;
 
   // Number of entries in the top-level ConditionList (0 if absent).
   uint32_t conditionCount = 0;
@@ -134,20 +137,19 @@ bool ReadUint32Var(ots::Buffer& buf, uint32_t* value) {
 // If |count_known| is true, exactly |known_count| values are decoded (and the
 // buffer is left positioned immediately after them). Otherwise values are
 // decoded until |buf| is exhausted. *out_count (if non-NULL) receives the
-// number of values decoded, and *out_values (if non-NULL) the values.
+// number of values decoded. Optional range and count limits avoid expanding
+// compact zero runs into attacker-controlled amounts of temporary storage.
 bool ParseTupleValues(const ots::Font* font, ots::Buffer& buf, bool count_known,
                       size_t known_count, size_t* out_count,
-                      std::vector<int32_t>* out_values) {
+                      bool validate_range = false, int32_t min_value = 0,
+                      int32_t max_value = 0,
+                      size_t max_count = std::numeric_limits<size_t>::max()) {
   static const uint8_t VALUES_SIZE_MASK = 0xC0;
   static const uint8_t VALUES_ARE_BYTES = 0x00;
   static const uint8_t VALUES_ARE_WORDS = 0x40;
   static const uint8_t VALUES_ARE_ZEROS = 0x80;
   static const uint8_t VALUES_ARE_LONGS = 0xC0;
   static const uint8_t RUN_COUNT_MASK = 0x3F;
-
-  if (out_values) {
-    out_values->clear();
-  }
 
   size_t total = 0;
   for (;;) {
@@ -168,13 +170,22 @@ bool ParseTupleValues(const ots::Font* font, ots::Buffer& buf, bool count_known,
     if (count_known && total + run > known_count) {
       return OTS_FAILURE_MSG("TupleValues run overshoots expected count");
     }
+    if (run > max_count - total) {
+      return OTS_FAILURE_MSG("TupleValues has too many values");
+    }
+
+    if ((control & VALUES_SIZE_MASK) == VALUES_ARE_ZEROS) {
+      if (validate_range && (0 < min_value || 0 > max_value)) {
+        return OTS_FAILURE_MSG("TupleValues value out of range");
+      }
+      total += run;
+      continue;
+    }
 
     for (size_t i = 0; i < run; ++i) {
       int32_t value = 0;
       bool ok = true;
       switch (control & VALUES_SIZE_MASK) {
-        case VALUES_ARE_ZEROS:
-          break;
         case VALUES_ARE_BYTES: {
           uint8_t v;
           ok = buf.ReadU8(&v);
@@ -193,12 +204,14 @@ bool ParseTupleValues(const ots::Font* font, ots::Buffer& buf, bool count_known,
           value = static_cast<int32_t>(v);
           break;
         }
+        case VALUES_ARE_ZEROS:
+          return OTS_FAILURE_MSG("Unexpected zero TupleValues run");
       }
       if (!ok) {
         return OTS_FAILURE_MSG("Failed to read TupleValues data");
       }
-      if (out_values) {
-        out_values->push_back(value);
+      if (validate_range && (value < min_value || value > max_value)) {
+        return OTS_FAILURE_MSG("TupleValues value %d out of range", value);
       }
     }
 
@@ -401,7 +414,8 @@ bool ParseMultiItemVariationData(const ots::Font* font, const uint8_t* data,
                          deltaSets[i].length);
     size_t numValues = 0;
     if (!ParseTupleValues(font, deltaSet, /*count_known=*/false, 0, &numValues,
-                          NULL)) {
+                          false, 0, 0,
+                          std::numeric_limits<uint32_t>::max())) {
       return OTS_FAILURE_MSG("Failed to parse delta set %u",
                              static_cast<unsigned>(i));
     }
@@ -456,7 +470,9 @@ bool ParseMultiItemVariationStore(const ots::Font* font, const uint8_t* data,
     return OTS_FAILURE_MSG("Failed to parse sparse variation region list");
   }
 
-  state->deltaSetTupleLengths.clear();
+  state->uniqueDeltaSetTupleLengths.clear();
+  state->outerToTupleLengths.clear();
+  std::map<uint32_t, uint32_t> parsedOffsets;
   for (unsigned i = 0; i < dataCount; ++i) {
     uint32_t offset;
     if (!subtable.ReadU32(&offset)) {
@@ -465,12 +481,22 @@ bool ParseMultiItemVariationStore(const ots::Font* font, const uint8_t* data,
     if (offset < headerEnd || offset >= length) {
       return OTS_FAILURE_MSG("Bad item variation data offset");
     }
-    std::vector<uint32_t> tupleLengths;
-    if (!ParseMultiItemVariationData(font, data + offset, length - offset,
-                                     regionCount, &tupleLengths)) {
-      return OTS_FAILURE_MSG("Failed to parse item variation data %u", i);
+    auto parsed = parsedOffsets.find(offset);
+    uint32_t tupleLengthsIndex;
+    if (parsed != parsedOffsets.end()) {
+      tupleLengthsIndex = parsed->second;
+    } else {
+      std::vector<uint32_t> tupleLengths;
+      if (!ParseMultiItemVariationData(font, data + offset, length - offset,
+                                       regionCount, &tupleLengths)) {
+        return OTS_FAILURE_MSG("Failed to parse item variation data %u", i);
+      }
+      tupleLengthsIndex = static_cast<uint32_t>(
+          state->uniqueDeltaSetTupleLengths.size());
+      state->uniqueDeltaSetTupleLengths.push_back(std::move(tupleLengths));
+      parsedOffsets[offset] = tupleLengthsIndex;
     }
-    state->deltaSetTupleLengths.push_back(std::move(tupleLengths));
+    state->outerToTupleLengths.push_back(tupleLengthsIndex);
   }
 
   return true;
@@ -491,10 +517,11 @@ bool ValidateVarIdx(const ots::Font* font, uint32_t varIdx,
   }
   const uint16_t outer = varIdx >> 16;
   const uint16_t inner = varIdx & 0xFFFFu;
-  if (outer >= state.deltaSetTupleLengths.size()) {
+  if (outer >= state.outerToTupleLengths.size()) {
     return OTS_FAILURE_MSG("VarIdx outer index %u out of range", outer);
   }
-  const std::vector<uint32_t>& tupleLengths = state.deltaSetTupleLengths[outer];
+  const std::vector<uint32_t>& tupleLengths =
+      state.uniqueDeltaSetTupleLengths[state.outerToTupleLengths[outer]];
   if (inner >= tupleLengths.size()) {
     return OTS_FAILURE_MSG("VarIdx inner index %u out of range", inner);
   }
@@ -517,17 +544,20 @@ const uint32_t kConditionRecursionLimit = 64;
 struct conditionContext {
   const uint8_t* data;
   size_t length;
-  std::vector<bool> validated;
+  // Zero means unvalidated; other values are one plus the maximum number of
+  // child edges below the condition at that byte offset.
+  std::vector<uint16_t> subtreeHeights;
 };
 
 bool ParseCondition(const ots::Font* font, conditionContext& ctx,
-                    size_t offset, const varcState& state, uint32_t depth);
+                    size_t offset, const varcState& state, uint32_t depth,
+                    uint32_t* outHeight);
 
 // Validate the condition at |offset| into the list (known to be in bounds).
 // Offsets to child conditions are relative to the condition containing them.
 bool ParseConditionUncached(const ots::Font* font, conditionContext& ctx,
                             size_t offset, const varcState& state,
-                            uint32_t depth) {
+                            uint32_t depth, uint32_t* outHeight) {
   ots::Buffer subtable(ctx.data + offset, ctx.length - offset);
   const size_t length = subtable.remaining();
 
@@ -555,6 +585,7 @@ bool ParseConditionUncached(const ots::Font* font, conditionContext& ctx,
       if (filterRangeMin > filterRangeMax) {
         OTS_WARNING("Misordered filter range in condition");
       }
+      *outHeight = 0;
       return true;
     }
 
@@ -567,6 +598,7 @@ bool ParseConditionUncached(const ots::Font* font, conditionContext& ctx,
       if (!ValidateVarIdx(font, varIdx, state, /*tupleLength=*/1)) {
         return OTS_FAILURE_MSG("Bad VarIdx in condition format 2");
       }
+      *outHeight = 0;
       return true;
     }
 
@@ -576,6 +608,7 @@ bool ParseConditionUncached(const ots::Font* font, conditionContext& ctx,
       if (!subtable.ReadU8(&conditionCount)) {
         return OTS_FAILURE_MSG("Failed to read condition format %u count", format);
       }
+      uint32_t height = 0;
       for (unsigned i = 0; i < conditionCount; ++i) {
         uint32_t childOffset;
         if (!subtable.ReadU24(&childOffset)) {
@@ -584,10 +617,16 @@ bool ParseConditionUncached(const ots::Font* font, conditionContext& ctx,
         if (childOffset < 2u || childOffset >= length) {
           return OTS_FAILURE_MSG("Bad child condition offset");
         }
-        if (!ParseCondition(font, ctx, offset + childOffset, state, depth + 1)) {
+        uint32_t childHeight = 0;
+        if (!ParseCondition(font, ctx, offset + childOffset, state, depth + 1,
+                            &childHeight)) {
           return OTS_FAILURE_MSG("Failed to parse child condition");
         }
+        if (childHeight + 1 > height) {
+          height = childHeight + 1;
+        }
       }
+      *outHeight = height;
       return true;
     }
 
@@ -599,9 +638,12 @@ bool ParseConditionUncached(const ots::Font* font, conditionContext& ctx,
       if (childOffset < 2u || childOffset >= length) {
         return OTS_FAILURE_MSG("Bad negated condition offset");
       }
-      if (!ParseCondition(font, ctx, offset + childOffset, state, depth + 1)) {
+      uint32_t childHeight = 0;
+      if (!ParseCondition(font, ctx, offset + childOffset, state, depth + 1,
+                          &childHeight)) {
         return OTS_FAILURE_MSG("Failed to parse negated condition");
       }
+      *outHeight = childHeight + 1;
       return true;
     }
 
@@ -611,17 +653,25 @@ bool ParseConditionUncached(const ots::Font* font, conditionContext& ctx,
 }
 
 bool ParseCondition(const ots::Font* font, conditionContext& ctx,
-                    size_t offset, const varcState& state, uint32_t depth) {
+                    size_t offset, const varcState& state, uint32_t depth,
+                    uint32_t* outHeight) {
   if (depth > kConditionRecursionLimit) {
     return OTS_FAILURE_MSG("Excessive condition nesting");
   }
-  if (ctx.validated[offset]) {
+  if (ctx.subtreeHeights[offset]) {
+    const uint32_t height = ctx.subtreeHeights[offset] - 1;
+    if (height > kConditionRecursionLimit - depth) {
+      return OTS_FAILURE_MSG("Excessive condition nesting");
+    }
+    *outHeight = height;
     return true;
   }
-  if (!ParseConditionUncached(font, ctx, offset, state, depth)) {
+  uint32_t height = 0;
+  if (!ParseConditionUncached(font, ctx, offset, state, depth, &height)) {
     return false;
   }
-  ctx.validated[offset] = true;
+  ctx.subtreeHeights[offset] = static_cast<uint16_t>(height + 1);
+  *outHeight = height;
   return true;
 }
 
@@ -638,7 +688,7 @@ bool ParseConditionList(const ots::Font* font, const uint8_t* data,
   conditionContext ctx;
   ctx.data = data;
   ctx.length = length;
-  ctx.validated.resize(length);
+  ctx.subtreeHeights.resize(length);
 
   for (unsigned i = 0; i < conditionCount; ++i) {
     uint32_t offset;
@@ -648,7 +698,8 @@ bool ParseConditionList(const ots::Font* font, const uint8_t* data,
     if (offset < 4u || offset >= length) {
       return OTS_FAILURE_MSG("Bad condition offset");
     }
-    if (!ParseCondition(font, ctx, offset, *state, 0)) {
+    uint32_t height = 0;
+    if (!ParseCondition(font, ctx, offset, *state, 0, &height)) {
       return OTS_FAILURE_MSG("Failed to parse condition %u", i);
     }
   }
@@ -670,18 +721,15 @@ bool ParseAxisIndicesList(const ots::Font* font, const uint8_t* data,
   state->axisIndicesCounts.clear();
   for (const auto& obj : objects) {
     ots::Buffer entry(data + obj.offset, obj.length);
-    std::vector<int32_t> axisIndices;
-    if (!ParseTupleValues(font, entry, /*count_known=*/false, 0, NULL,
-                          &axisIndices)) {
+    size_t axisIndicesCount = 0;
+    if (!ParseTupleValues(font, entry, /*count_known=*/false, 0,
+                          &axisIndicesCount, true, 0,
+                          static_cast<int32_t>(state->axisCount) - 1,
+                          state->axisCount)) {
       return OTS_FAILURE_MSG("Failed to parse axisIndices entry");
     }
-    for (int32_t axisIndex : axisIndices) {
-      if (axisIndex < 0 || axisIndex >= state->axisCount) {
-        return OTS_FAILURE_MSG("Axis index %d out of range", axisIndex);
-      }
-    }
     state->axisIndicesCounts.push_back(
-        static_cast<uint32_t>(axisIndices.size()));
+        static_cast<uint32_t>(axisIndicesCount));
   }
 
   return true;
@@ -737,16 +785,9 @@ bool ParseVarComponent(const ots::Font* font, ots::Buffer& rec,
                              axisIndicesIndex);
     }
     numAxisValues = state.axisIndicesCounts[axisIndicesIndex];
-    std::vector<int32_t> axisValues;
     if (!ParseTupleValues(font, rec, /*count_known=*/true, numAxisValues, NULL,
-                          &axisValues)) {
+                          true, -0x4000, 0x4000, numAxisValues)) {
       return OTS_FAILURE_MSG("Failed to read component axis values");
-    }
-    // Axis values are normalized F2Dot14 coordinates, so within [-1, 1].
-    for (int32_t axisValue : axisValues) {
-      if (axisValue < -0x4000 || axisValue > 0x4000) {
-        return OTS_FAILURE_MSG("Component axis value %d out of range", axisValue);
-      }
     }
   }
 
@@ -866,9 +907,18 @@ bool OpenTypeVARC::Parse(const uint8_t* data, size_t length) {
   }
   state.numGlyphs = maxp->num_glyphs;
 
-  // fvar is optional: a static font may use VARC without variation axes.
+  // fvar is optional.  A static VARC font may use the axes internal to gvar or
+  // CFF2 without exposing them as user-selectable design axes.
   auto* fvar = static_cast<OpenTypeFVAR*>(font->GetTypedTable(OTS_TAG_FVAR));
-  state.axisCount = fvar ? fvar->AxisCount() : 0;
+  if (fvar) {
+    state.axisCount = fvar->AxisCount();
+  } else if (auto* gvar = static_cast<OpenTypeGVAR*>(
+                 font->GetTypedTable(OTS_TAG_GVAR))) {
+    state.axisCount = gvar->AxisCount();
+  } else if (auto* cff2 = static_cast<OpenTypeCFF2*>(
+                 font->GetTypedTable(OTS_TAG_CFF2))) {
+    state.axisCount = cff2->variation_axis_count;
+  }
 
   // Coverage and glyphRecords are required; the others may be NULL.
   if (coverageOffset < headerSize || coverageOffset >= length) {
@@ -921,19 +971,22 @@ bool OpenTypeVARC::Parse(const uint8_t* data, size_t length) {
   }
 
   // The coverage table's glyphs index the glyphRecords sequentially, so their
-  // counts must agree. ParseCoverageTable treats an expected count of 0 as
-  // "don't check", and coverage cannot express more than 0xFFFF glyphs, so
-  // reject both extremes up front rather than skipping the check.
-  if (glyphRecordCount == 0) {
-    return Error("No glyph records");
-  }
+  // counts must agree. Coverage cannot express more than 0xFFFF glyphs.
   if (glyphRecordCount > 0xFFFF) {
     return Error("Too many glyph records: %u", glyphRecordCount);
   }
-  if (!ParseCoverageTable(font, data + coverageOffset, length - coverageOffset,
-                          state.numGlyphs,
-                          static_cast<uint16_t>(glyphRecordCount))) {
+  uint32_t coverageGlyphCount = 0;
+  uint16_t lastCoveredGlyph = 0;
+  if (!ParseCoverageTable(font, data + coverageOffset,
+                          length - coverageOffset, state.numGlyphs, 0,
+                          &coverageGlyphCount, &lastCoveredGlyph)) {
     return Error("Failed to parse coverage table");
+  }
+  if (coverageGlyphCount != glyphRecordCount) {
+    return Error("Coverage and glyphRecords counts differ");
+  }
+  if (coverageGlyphCount && lastCoveredGlyph >= state.numGlyphs) {
+    return Error("Covered glyph %u out of range", lastCoveredGlyph);
   }
 
   this->m_data = data;
